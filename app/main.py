@@ -16,6 +16,7 @@ import io
 from fastapi.encoders import jsonable_encoder
 from typing import Optional
 from psycopg2 import pool
+import asyncio
 
 SECRET_KEY = "41b2ae40f9299813102265496f77665b12163f2386d4fc3ec7a8bcfa4ec56931"
 ALGORITHM = "HS256"
@@ -336,6 +337,8 @@ def get_totaldials(request:Request, current_user: dict = Depends(get_current_use
         conn = mysql.connector.connect(**DB_CONFIG)
         cursor = conn.cursor(dictionary=True)
         today_start = date.today()
+        sd = request.query_params.get("sd")
+        ed = request.query_params.get("ed")
 
         print("cuerrrrr --- ", current_user)
 
@@ -346,20 +349,21 @@ def get_totaldials(request:Request, current_user: dict = Depends(get_current_use
 
         userfitler = f" and v.user='{user_id}' and v.campaign_id='{campaign_id}' " if not is_admin else ""
  
-        query  = f""" SELECT
+        query  = f""" select total_dials,connected_calls,connection_rate_pct,total_talk_time,avg_talk_time_sec,leads_connected,sum(total_seconds)total_seconds from (
+                        SELECT
                         DATE(v.call_date) AS call_date,
-                        (select count(*)Total_calls from vicidial_log v where date(call_date) = %s {userfitler}) AS total_dials,
-                        (select count(*) from vicidial_log v where date(call_date) =%s  and length_in_sec > 0 {userfitler}) AS connected_calls,
+                        (select count(*)Total_calls from vicidial_log v where date(call_date)  BETWEEN %s AND %s {userfitler}) AS total_dials,
+                        (select count(*) from vicidial_log v where date(call_date)  BETWEEN %s AND %s  and length_in_sec > 0 {userfitler}) AS connected_calls,
                         ROUND((SUM(v.length_in_sec > 0) / COUNT(*)) * 100, 2 )  AS connection_rate_pct,
-                        (SELECT SUM(length_in_sec) FROM vicidial_log v  WHERE DATE(call_date)= %s {userfitler}) AS total_talk_time,
-                        (select AVG(length_in_sec) from vicidial_log v where date(call_date)= %s and length_in_sec >0 {userfitler} ) AS avg_talk_time_sec,
+                        (SELECT SUM(length_in_sec) FROM vicidial_log v  WHERE DATE(call_date) BETWEEN %s AND %s {userfitler}) AS total_talk_time,
+                        (select AVG(length_in_sec) from vicidial_log v where date(call_date) BETWEEN %s AND %s and length_in_sec >0 {userfitler} ) AS avg_talk_time_sec,
                         COUNT(distinct v.lead_id) AS leads_connected,
                         SUM(length_in_sec) AS total_seconds
                     FROM vicidial_log v 
-                    where date(v.call_date) = %s {userfitler} GROUP BY DATE(v.call_date) ;
+                    where date(v.call_date)  BETWEEN %s AND %s {userfitler} GROUP BY DATE(v.call_date))a ;
                     """
  
-        cursor.execute(query,(today_start,today_start,today_start,today_start,today_start,))
+        cursor.execute(query,(f"{sd}",f"{ed}",f"{sd}",f"{ed}",f"{sd}",f"{ed}",f"{sd}",f"{ed}",f"{sd}",f"{ed}",))
      
 
         result = cursor.fetchall()
@@ -406,38 +410,35 @@ def get_dialerperformance(current_user: str = Depends(get_current_user)):
 
 #Agent Productivity
 @app.get('/agentsproductivity')
-def get_agentsproductivity( current_user: str = Depends(get_current_user)):
+def get_agentsproductivity(request:Request, current_user: str = Depends(get_current_user)):
     try:    
         conn = mysql.connector.connect(**DB_CONFIG)
         cursor = conn.cursor(dictionary=True)
+        sd = request.query_params.get("sd")
+        ed = request.query_params.get("ed")
+
+        # if sd and ed :
+
         today_start = date.today()
-        query  = """ SELECT vla.extension AS STATION, vla.user AS USER_ID,vu.full_name AS USER_NAME,vla.status AS STATUS,vla.calls_today AS CALLS,
-                        COUNT(vl.lead_id) AS connected_calls, MAX(vl.phone_number) AS phone_number,
-                        (UNIX_TIMESTAMP(NOW()) - UNIX_TIMESTAMP(vla.last_state_change)) AS TALK_TIME_SECONDS,
-                        SEC_TO_TIME(IFNULL(al.login_seconds, 0)) AS login_duration
-                        FROM vicidial_live_agents vla 
-                        left join vicidial_users vu on vla.user=vu.user
-                        LEFT JOIN vicidial_log vl ON vla.user = vl.user AND DATE(vl.call_date) = %s
-                        AND vl.length_in_sec > 0
+        query  = """ SELECT  CONCAT('SIP/',vl.user) AS STATION,vl.user AS USER_ID,
+                        vu.full_name AS USER_NAME,vla.status AS STATUS,
+                        COUNT(*) AS CALLS,SUM(vl.length_in_sec > 0) AS connected_calls,
+                        MAX(vl.phone_number) AS phone_number,SEC_TO_TIME(IFNULL(al.login_seconds,0)) AS login_duration,
+                        (UNIX_TIMESTAMP(NOW()) - UNIX_TIMESTAMP(vla.last_state_change)) AS TALK_TIME_SECONDS
+                        FROM vicidial_log vl
+                        LEFT JOIN vicidial_users vu  ON vl.user = vu.user
+                        LEFT JOIN vicidial_live_agents vla ON vl.user = vla.user    
                         LEFT JOIN (
-                            SELECT
-                                user,
-                                SUM(pause_sec + wait_sec + talk_sec + dispo_sec) AS login_seconds
-                            FROM vicidial_agent_log
-                            WHERE DATE(event_time) = %s
+                            SELECT user,SUM(pause_sec + wait_sec + talk_sec + dispo_sec) AS login_seconds
+                            FROM vicidial_agent_log WHERE DATE(event_time) BETWEEN %s AND %s
                             GROUP BY user
-                        ) al ON vla.user = al.user
-                        GROUP BY
-                            vla.extension,
-                            vla.user,
-                            vla.status,
-                            vla.calls_today,
-                            vla.last_state_change,
-                            al.login_seconds
-                        ORDER BY
-                            vla.status,
-                            vla.user;"""
-        cursor.execute(query,(today_start,today_start,))
+                        ) al  ON vl.user = al.user
+                        WHERE DATE(vl.call_date) BETWEEN %s AND %s
+                        GROUP BY vl.user, vl.campaign_id
+                        ORDER BY vl.user;
+                        """
+        
+        cursor.execute(query,(f"{sd}",f"{ed}",f"{sd}",f"{ed}",))
         result = cursor.fetchall()
         for row in result:
             seconds = row.get("TALK_TIME_SECONDS", 0)
@@ -455,20 +456,23 @@ def get_agentsproductivity( current_user: str = Depends(get_current_user)):
 
 #Agent Productivity
 @app.get('/campaignperformance')
-def get_campaignperformance(current_user: str = Depends(get_current_user)):
+def get_campaignperformance(request:Request,current_user: str = Depends(get_current_user)):
     try:    
         conn = mysql.connector.connect(**DB_CONFIG)
         cursor = conn.cursor(dictionary=True)
+        sd = request.query_params.get("sd")
+        ed = request.query_params.get("ed")
         today_start = date.today()
+
         query  = """ SELECT vl.campaign_id,COUNT(*) AS total_dials,SUM(vl.length_in_sec > 0) AS connected_calls,
                         ROUND( (SUM(vl.length_in_sec > 0) / COUNT(*)) * 100, 2 ) AS connection_rate_pct,
                         SEC_TO_TIME(SUM(vl.length_in_sec)) AS total_talk_time,
                         AVG(vl.length_in_sec) AS avg_talk_time,
                         ROUND( (SUM(vl.status = 'DROP') / COUNT(*)) * 100, 2 ) AS drop_rate_pct,
-                        SUM(vl.status IN ('SALE','SUCCESS','CONVERTED')) AS conversions FROM vicidial_log vl WHERE DATE(vl.call_date) = %s  GROUP BY vl.campaign_id
+                        SUM(vl.status IN ('SALE','SUCCESS','CONVERTED')) AS conversions FROM vicidial_log vl WHERE DATE(vl.call_date) between %s and %s  GROUP BY vl.campaign_id
                         ORDER BY total_dials DESC; """
                                             
-        cursor.execute(query,(today_start,))
+        cursor.execute(query,(f"{sd}",f"{ed}",))
         result = cursor.fetchall()
         for row in result:
             if hasattr(row["total_talk_time"], "total_seconds"):
@@ -1665,4 +1669,30 @@ def get_active_campaigns():
             cursor.close()
         if conn:
             conn.close()
+
+
+@app.get("/delete_lead")
+def delet_lead(request: Request, current_user: str = Depends(get_current_user)):
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cursor = conn.cursor(dictionary=True)
+    phone_number = request.query_params.get("phone_number") 
+    try : 
+        
+        delete_leads_query = "DELETE FROM vicidial_list WHERE phone_number = %s"
+        cursor.execute(delete_leads_query, (phone_number,))
+            
+        delete_logs_query = "DELETE FROM vicidial_log WHERE phone_number = %s"
+        cursor.execute(delete_logs_query, (phone_number,))
+
+        # delete_carrier_log_query = "DELETE FROM vicidial_carrier_log WHERE phone_number = %s"
+        # cursor.execute(delete_carrier_log_query, (phone_number,))
+
+        conn.commit()
+
+        cursor.close()
+        conn.close()
+        return {"message": f"Records for phone number {phone_number} deleted successfully"}
+    except Error as e :
+        raise HTTPException(status_code=500, detail=f"Error deleting records{e}")
+    
 

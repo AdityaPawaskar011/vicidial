@@ -17,6 +17,9 @@ from fastapi.encoders import jsonable_encoder
 from typing import Optional
 from psycopg2 import pool
 import asyncio
+from pydantic import BaseModel
+from typing import List
+import re
 
 SECRET_KEY = "41b2ae40f9299813102265496f77665b12163f2386d4fc3ec7a8bcfa4ec56931"
 ALGORITHM = "HS256"
@@ -1008,17 +1011,25 @@ def validate_list_campaign(list_id, campaign_id):
 def upload_excel_leads(
     campaign_id: str = Form(...),
     campaign_name: str = Form(...),
-    
-    
     file: UploadFile = File(...),  current_user: str = Depends(get_current_user)):
    
 
-    if not file.filename.endswith(".xlsx"):
-        raise HTTPException(status_code=400, detail="Only .xlsx file allowed")
+    # if not file.filename.endswith(".xlsx"):
+    #     raise HTTPException(status_code=400, detail="Only .xlsx file allowed")\
+        
+    if not (file.filename.endswith(".xlsx") or file.filename.endswith(".csv")):
+        raise HTTPException(
+            status_code=400,
+            detail="Only .xlsx or .csv files allowed"
+        )
+
 
     try:
         contents = file.file.read()
-        df = pd.read_excel(io.BytesIO(contents), dtype=str)
+        if file.filename.endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(contents), dtype=str, encoding="utf-8")
+        else:
+            df = pd.read_excel(io.BytesIO(contents), dtype=str)
         print(df)
 
     except Exception as e:
@@ -1109,6 +1120,9 @@ def upload_excel_leads(
 
             if "SUCCESS" in response.text.upper():
                 success += 1
+        
+        
+        
                 existing_phones.add(phone)
             else:
                 failed.append({
@@ -1222,20 +1236,25 @@ API_PASS = "AdminR"
 AGENT_USER = "8015"
 
 def pauseUser(current_user):
-    res = requests.get(
-        VICIDIAL_API_URL,
-        params={
-            "source": "ctestrm",
-            "user": API_USER,
-            "pass": API_PASS,
-            "agent_user": current_user["username"],
-            "function": "external_pause",
-            "value": "PAUSE"
-        },
-        timeout=10
-    )
+    print("Pausing agent : ", current_user)
+    try:
+        res = requests.get(
+            VICIDIAL_API_URL,
+            params={
+                "source": "ctestrm",
+                "user": API_USER,
+                "pass": API_PASS,
+                "agent_user": current_user["username"],
+                "function": "external_pause",
+                "value": "PAUSE"
+            },
+            timeout=10
+        )
+        print(f"Pause Response : ", res.content)
+    except Exception as e:
+        print("Failed to pause ", str(e))
     return res.text
-
+ 
 def get_agent_status(username):
     conn = mysql.connector.connect(**DB_CONFIG)
     cursor = conn.cursor(dictionary=True)
@@ -1251,70 +1270,218 @@ def get_agent_status(username):
 
     return row["status"] if row else None
 
+# @app.post("/call")
+# def call_number(phone: Optional[str] = None,current_user: str = Depends(get_current_user)):
+#     userDetails = None
+
+#     if not phone:
+#         conn = mysql.connector.connect(**DB_CONFIG)
+#         cursor = conn.cursor(dictionary=True)
+#         today_start = date.today()
+#         campaign_id = current_user["campaign_id"]
+#         campaign_name = current_user["campaign_name"]
+#         query = """
+                
+#                     select * from (
+#                     select DISTINCT vl.phone_number, vl.lead_id, vl.first_name, vl.last_name, vl.status,""callback_time,""comments
+#                     FROM vicidial_list vl  
+#                     INNER JOIN vicidial_lists vls ON vl.list_id =vls.list_id 
+#                     where vl.lead_id  not in (select distinct lead_id from vicidial_log) and vl.status in ('NEW') AND vls.campaign_id =%s
+#                     )a   where  a.status  in ('NEW') order by a.lead_id  
+#                           limit 1 """
+#         params = (campaign_id,)
+#         cursor.execute(query,params,)
+#         userDetails = cursor.fetchone()
+#         print(userDetails)
+#         cursor.close()
+#         conn.close()
+
+#         if not userDetails:
+#             raise HTTPException(404, "No callable leads found")
+
+#         phone = userDetails["phone_number"]
+
+#     params = {
+#         "source": "crm",
+#         "user": API_USER,
+#         "pass": API_PASS,
+#         "agent_user": current_user["username"],
+#         "function": "external_dial",
+#         "phone_code": "1",
+#         "value": phone,
+#         "preview": "NO",
+#         "search": "YES",
+#         "focus": "YES"
+#     }
+
+#     # agent_status = get_agent_status(current_user["username"])
+
+#     # if agent_status != "PAUSED":
+#     pause_response = pauseUser(current_user)
+#     time.sleep(5)  # allow VICIdial to update state
+
+
+#     try:
+#         response = requests.get(VICIDIAL_API_URL, params=params, timeout=10)
+#     except requests.exceptions.RequestException as e:
+#         raise HTTPException(500, str(e))
+
+#     return {
+#         "status": "success",
+#         "dialed_phone": phone,
+#         "vicidial_response": response.text,
+#         "details": jsonable_encoder(userDetails)
+#     }
+
 @app.post("/call")
-def call_number(phone: Optional[str] = None,current_user: str = Depends(get_current_user)):
+def call_number(phone: Optional[str] = None, current_user: str = Depends(get_current_user)):
     userDetails = None
+    lead_id     = None
+    agent_user  = current_user["username"]
+    campaign_id = current_user["campaign_id"]
+
+    # ─────────────────────────────────────────
+    # STEP 1 — Pause agent and confirm via DB
+    # ─────────────────────────────────────────
+    pauseUser(current_user)
+
+    # Wait until DB confirms agent is paused
+    paused = False
+    for i in range(10):
+        status = get_agent_status(agent_user)
+        print(f"[AGENT STATUS {i+1}s]: {status}")
+        if status in ("PAUSED", "PAUSE"):
+            paused = True
+            break
+        time.sleep(1)
+
+    if not paused:
+        raise HTTPException(500, "Agent could not be paused. Please check agent is logged into VICIdial.")
 
     if not phone:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        cursor = conn.cursor(dictionary=True)
-        today_start = date.today()
-        campaign_id = current_user["campaign_id"]
-        campaign_name = current_user["campaign_name"]
-        query = """
-                
-                    select * from (
-                    select DISTINCT vl.phone_number, vl.lead_id, vl.first_name, vl.last_name, vl.status,""callback_time,""comments
-                    FROM vicidial_list vl  
-                    INNER JOIN vicidial_lists vls ON vl.list_id =vls.list_id 
-                    where vl.lead_id  not in (select distinct lead_id from vicidial_log) and vl.status in ('NEW') AND vls.campaign_id =%s
-                    )a   where  a.status  in ('NEW') order by a.lead_id  
-                          limit 1
-                                    """
-        params = (campaign_id,)
-        cursor.execute(query,params,)
-        userDetails = cursor.fetchone()
-        print(userDetails)
-        cursor.close()
-        conn.close()
+        try:
+            conn   = mysql.connector.connect(**DB_CONFIG)
+            cursor = conn.cursor(dictionary=True)
 
-        if not userDetails:
-            raise HTTPException(404, "No callable leads found")
+            # ─────────────────────────────────────────
+            # STEP 2 — Atomically claim lead
+            # lock_token guarantees no two agents
+            # ever claim the same lead simultaneously
+            # ─────────────────────────────────────────
+            lock_token = f"{agent_user}_{int(time.time()*1000)}"
 
-        phone = userDetails["phone_number"]
+            cursor.execute("""
+                UPDATE vicidial_list vl
+                INNER JOIN vicidial_lists vls ON vl.list_id = vls.list_id
+                SET vl.status = 'INCALL',
+                    vl.user   = %s
+                WHERE vl.status       = 'NEW'
+                  AND vls.campaign_id = %s
+                  AND vl.lead_id NOT IN (SELECT lead_id FROM vicidial_log)
+                ORDER BY vl.lead_id ASC
+                LIMIT 1
+            """, (lock_token, campaign_id))
 
-    params = {
-        "source": "crm",
-        "user": API_USER,
-        "pass": API_PASS,
-        "agent_user": current_user["username"],
-        "function": "external_dial",
+            conn.commit()
+
+            if cursor.rowcount == 0:
+                raise HTTPException(404, "No callable leads found")
+
+            # ─────────────────────────────────────────
+            # STEP 3 — Fetch exactly the lead we claimed
+            # ─────────────────────────────────────────
+            cursor.execute("""
+                SELECT  vl.lead_id,
+                        vl.phone_number,
+                        vl.first_name,
+                        vl.last_name,
+                        vl.comments
+                FROM vicidial_list vl
+                WHERE vl.user   = %s
+                  AND vl.status = 'INCALL'
+                ORDER BY vl.lead_id ASC
+                LIMIT 1
+            """, (lock_token,))
+
+            row = cursor.fetchone()
+            print(f"[CLAIMED LEAD]: {row}")
+
+            if not row:
+                raise HTTPException(404, "No callable leads found")
+
+            lead_id     = row["lead_id"]
+            phone       = row["phone_number"]
+            userDetails = row
+
+            # ─────────────────────────────────────────
+            # STEP 4 — Set real agent on the lead
+            # ─────────────────────────────────────────
+            cursor.execute("""
+                UPDATE vicidial_list
+                SET user = %s
+                WHERE lead_id = %s
+            """, (agent_user, lead_id))
+            conn.commit()
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(500, f"DB error: {str(e)}")
+        finally:
+            cursor.close()
+            conn.close()
+
+    # ─────────────────────────────────────────
+    # STEP 5 — Dial via VICIdial
+    # ─────────────────────────────────────────
+    dial_params = {
+        "source":     "crm",
+        "user":       API_USER,
+        "pass":       API_PASS,
+        "agent_user": agent_user,
+        "function":   "external_dial",
         "phone_code": "1",
-        "value": phone,
-        "preview": "NO",
-        "search": "YES",
-        "focus": "YES"
+        "value":      phone,
+        "preview":    "NO",
+        "search":     "YES",
+        "focus":      "YES",
+        "lead_id":    lead_id,
     }
 
-    agent_status = get_agent_status(current_user["username"])
-
-    if agent_status != "PAUSED":
-        pause_response = pauseUser(current_user)
-        time.sleep(2)  # allow VICIdial to update state
-
-
     try:
-        response = requests.get(VICIDIAL_API_URL, params=params, timeout=10)
+        response = requests.get(VICIDIAL_API_URL, params=dial_params, timeout=10)
+        print(f"[DIAL RESPONSE]: {response.text}")
     except requests.exceptions.RequestException as e:
         raise HTTPException(500, str(e))
 
-    return {
-        "status": "success",
-        "dialed_phone": phone,
-        "vicidial_response": response.text,
-        "details": jsonable_encoder(userDetails)
-    }
+    # ─────────────────────────────────────────
+    # STEP 6 — If dial fails release lead back
+    # ─────────────────────────────────────────
+    if "ERROR" in response.text.upper():
+        try:
+            conn   = mysql.connector.connect(**DB_CONFIG)
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE vicidial_list
+                SET status = 'NEW', user = ''
+                WHERE lead_id = %s
+            """, (lead_id,))
+            conn.commit()
+        except Exception:
+            pass
+        finally:
+            cursor.close()
+            conn.close()
 
+        raise HTTPException(500, f"VICIdial dial error: {response.text}")
+
+    return {
+        "status":            "success",
+        "dialed_phone":      phone,
+        "lead_id":           lead_id,
+        "vicidial_response": response.text,
+        "details":           jsonable_encoder(userDetails),
+    }
 #Hangup
 # Hangup (fallback-safe)
 # @app.post("/hangup")
@@ -1467,20 +1634,23 @@ def vicidial_agent_action(
     responses["hangup"] = hangup_resp.text
 
     # 4️⃣ Pause
+    # time.sleep(5)
+    # pause_resp = requests.get(
+    #     VICIDIAL_API_URL,
+    #     params={
+    #         "source": "crm",
+    #         "user": API_USER,
+    #         "pass": API_PASS,
+    #         "agent_user": current_user["username"],
+    #         "function": "external_pause",
+    #         "value": "PAUSE"
+    #     },
+    #     timeout=10
+    # )
+    # responses["pause"] = pause_resp.tex
     time.sleep(5)
-    pause_resp = requests.get(
-        VICIDIAL_API_URL,
-        params={
-            "source": "crm",
-            "user": API_USER,
-            "pass": API_PASS,
-            "agent_user": current_user["username"],
-            "function": "external_pause",
-            "value": "PAUSE"
-        },
-        timeout=10
-    )
-    responses["pause"] = pause_resp.text
+    pause_text = pauseUser(current_user)  # ✅ reusing your existing function
+    responses["pause"] = pause_text
 
     return {
         "success": True,
@@ -1669,19 +1839,34 @@ def get_active_campaigns():
         if conn:
             conn.close()
 
+class DeleteLeadRequest(BaseModel):
+    phone_number: List[str]
 
-@app.get("/delete_lead")
-def delet_lead(request: Request, current_user: str = Depends(get_current_user)):
+@app.post("/delete_lead")
+def delet_lead(data: DeleteLeadRequest, current_user: str = Depends(get_current_user)):
     conn = mysql.connector.connect(**DB_CONFIG)
     cursor = conn.cursor(dictionary=True)
-    phone_number = request.query_params.get("phone_number") 
+    #r phone_number = request.query_params.get("phone_numbe") 
     try : 
         
-        delete_leads_query = "DELETE FROM vicidial_list WHERE phone_number = %s"
-        cursor.execute(delete_leads_query, (phone_number,))
-            
-        delete_logs_query = "DELETE FROM vicidial_log WHERE phone_number = %s"
-        cursor.execute(delete_logs_query, (phone_number,))
+        
+        phone_list = data.phone_number #.strip("[]").split(",")
+
+        phone_list = [p.strip() for p in phone_list]
+
+        placeholders = ",".join(["%s"] * len(phone_list))
+
+        delete_leads_query = f"""
+            DELETE FROM vicidial_list
+            WHERE phone_number IN ({placeholders})
+        """
+        cursor.execute(delete_leads_query, tuple(phone_list))
+
+        delete_logs_query = f"""
+            DELETE FROM vicidial_log
+            WHERE phone_number IN ({placeholders})
+        """
+        cursor.execute(delete_logs_query, tuple(phone_list))
 
         # delete_carrier_log_query = "DELETE FROM vicidial_carrier_log WHERE phone_number = %s"
         # cursor.execute(delete_carrier_log_query, (phone_number,))
@@ -1690,8 +1875,96 @@ def delet_lead(request: Request, current_user: str = Depends(get_current_user)):
 
         cursor.close()
         conn.close()
-        return {"message": f"Records for phone number {phone_number} deleted successfully"}
+        return {"message": f"Records for phone number {data.phone_number} deleted successfully"}
     except Error as e :
         raise HTTPException(status_code=500, detail=f"Error deleting records{e}")
     
 
+
+@app.get("/status_data")
+def get_status(current_user: str = Depends(get_current_user)):
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cursor = conn.cursor(dictionary=True)
+    user_id = current_user["username"]
+
+
+    try:
+
+        params = {
+            "source": "fastapi",
+            "user": API_USER,
+            "pass": API_PASS,
+            "function": "agent_status",
+            "agent_user": user_id
+        }
+
+        response = requests.get(vicidial_url, params=params)
+
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail="VICIdial API not reachable")
+
+        data = response.text
+
+        # -------- STATUS LOGIC --------
+        if "INCALL" in data:
+            call_status = "IN_CALL"
+
+        elif "QUEUE" in data or "RINGING" in data:
+            call_status = "RINGING"
+
+        elif "DISPO" in data:
+            call_status = "DISPOSITION_PENDING"
+
+        elif "PAUSED" in data:
+            call_status = "PAUSED"
+
+        elif "READY" in data:
+            call_status = "READY"
+
+        else:
+            call_status = "DISCONNECTED"
+
+
+        return {
+            "status": "success",
+            "data": {
+                "agent": user_id,
+                "call_status": call_status
+            }
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting status: {e}")
+
+@app.get("/callusingzoho")
+def call_number(phone: Optional[str] = None):
+    userDetails = None
+
+    params = {
+        "source": "crm",
+        "user": API_USER,
+        "pass": API_PASS,
+        "agent_user": '8999',
+        "function": "external_dial",
+        "phone_code": "1",
+        "value": phone,
+        "preview": "NO",
+        "search": "YES",
+        "focus": "YES"
+    }
+
+    pause_response = pauseUser({"username": 8999})
+    time.sleep(5)  # allow VICIdial to update state
+
+
+    try:
+        response = requests.get(VICIDIAL_API_URL, params=params, timeout=10)
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(500, str(e))
+
+    return {
+        "status": "success",
+        "dialed_phone": phone,
+        "vicidial_response": response.text,
+        "details": jsonable_encoder(userDetails)
+    }

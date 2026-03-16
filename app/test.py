@@ -453,14 +453,23 @@ def process_recording(row: dict) -> dict:
     if not location:
         raise Exception("No location URL.")
 
-    tmp_path = None
+    tmp_path = None  # ← Fix #1: initialize before try
     try:
-        tmp_path   = download_audio(location)
-        transcript = transcribe_audio(tmp_path)
-        print(f"[Whisper] {filename} → {len(transcript)} chars")
-        rating     = rate_agent(transcript)
+        tmp_path         = download_audio(location)
+        transcript       = transcribe_audio(tmp_path)
+        transcript_clean = transcript.strip()
+
+        print(f"[Whisper] {filename} → {len(transcript_clean)} chars")
+
+        if len(transcript_clean) < 20:
+            raise Exception(
+                f"Transcript too short ({len(transcript_clean)} chars) — "
+                "audio is likely silent, corrupt, or a missed call."
+            )
+
+        rating = rate_agent(transcript_clean)
         print(f"[GPT-4o]  {filename} → {rating.get('stars')}/5 stars")
-        update_analysis(row_id, transcript, rating)
+        update_analysis(row_id, transcript_clean, rating)  # ← also use clean here
 
         return {
             "id":               row_id,
@@ -474,7 +483,7 @@ def process_recording(row: dict) -> dict:
             "categories":       rating.get("categories"),
             "strengths":        rating.get("strengths"),
             "improvements":     rating.get("improvements"),
-            "transcript":       transcript,
+            "transcript":       transcript_clean,  # ← Fix #2: return clean version
         }
     finally:
         if tmp_path and os.path.exists(tmp_path):

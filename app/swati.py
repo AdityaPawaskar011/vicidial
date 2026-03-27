@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from openai import OpenAI
+from urllib.parse import urlparse, urlunparse
 
 # ── Optional pydub (needs ffmpeg installed + audioop-lts on Python 3.13) ──
 try:
@@ -62,7 +63,7 @@ BOOST_TARGET_DBFS         = -18.0
 # ─────────────────────────────────────────────
 # STATUS VALUES  (call_analysis.status column)
 # ─────────────────────────────────────────────
-#  pending       — inserted with valid location, not yet processed
+#  pending       — inserted with valid MP3 location, not yet processed
 #  not_picked    — ringing-only audio  OR  GPT confirmed "Not Connected"
 #  successful    — fully transcribed & rated by GPT-4o (stars >= 1)
 #  failed        — unrecoverable processing error
@@ -89,7 +90,7 @@ _loop_lock = threading.Lock()
 app = FastAPI(
     title="VICIdial Call Quality Analyzer",
     description="Auto sync + analyze every 5 minutes",
-    version="5.4.0",
+    version="5.5.0",
 )
 
 # ─────────────────────────────────────────────
@@ -167,6 +168,13 @@ def extract_phone_number(location: str):
         return None
     match = re.search(r'\d{8}-\d{6}_(\d+)_', location)
     return match.group(1) if match else None
+
+
+def is_mp3_location(location: str) -> bool:
+    """Return True only if the location URL points to an MP3 file."""
+    if not location:
+        return False
+    return location.strip().lower().endswith(".mp3")
 
 
 def get_mysql_conn():
@@ -417,7 +425,7 @@ def create_table():
 
         conn.commit()
         cur.close()
-        print("[DB] Table 'call_analysis' ready (v5.4).")
+        print("[DB] Table 'call_analysis' ready (v5.5).")
     finally:
         conn.close()
 
@@ -425,39 +433,42 @@ def create_table():
 # ═══════════════════════════════════════════════════════════════
 #  SYNC  — MySQL recording_log → PostgreSQL call_analysis
 #
-#  KEY RULE: Only insert rows where location IS NOT NULL and NOT empty.
-#  Rows without a location are skipped and retried next cycle —
-#  MySQL populates location after the recording file is written,
-#  so a NULL location simply means the file isn't ready yet.
+#  INSERT conditions (ALL must be true):
+#    1. filename is not empty
+#    2. location is NOT NULL and NOT empty
+#    3. location ends with .mp3  (WAV = skip, retry next cycle)
+#    4. filename not already in PG
 # ═══════════════════════════════════════════════════════════════
 
 def sync_recording_log(target_date: str = None) -> dict:
     """
-    Pull rows from MySQL recording_log for target_date.
+    Pull rows from MySQL recording_log for target_date and insert into PG.
 
-    Rules:
-      • ONLY insert rows where location IS NOT NULL and NOT empty.
-        Rows without location are skipped — next cycle will pick them up
-        once MySQL has populated the recording path.
-      • All inserted rows start as status='pending'.
-      • No disposition filtering — audio + GPT decide not_picked.
-      • ON CONFLICT (filename) DO NOTHING — safe to run repeatedly.
-      • Also updates location/length for existing pending rows whose
-        MySQL record now has a location (late-arriving files).
+    Skip rules (retried automatically next cycle):
+      • location IS NULL or empty  — file not written yet
+      • location ends with .wav    — WAV not yet converted to MP3
+
+    All inserted rows start as status='pending'.
+    Audio + GPT pipeline is the sole decider of not_picked.
+    ON CONFLICT (filename) DO NOTHING — safe to run repeatedly.
+
+    Also backfills existing pending PG rows:
+      • NULL location rows  — if MySQL now has a location
+      • WAV location rows   — if MySQL now has an MP3 location
     """
     if not target_date:
         target_date = today_str()
 
-    mysql_conn      = get_mysql_conn()
-    inserted        = 0
-    skipped_no_loc  = 0   # skipped because location is NULL in MySQL
-    skipped_exists  = 0   # skipped because already in PG
-    location_fixed  = 0   # existing PG rows whose location was backfilled
-    errors          = []
-    inserted_rows   = []
+    mysql_conn     = get_mysql_conn()
+    inserted       = 0
+    skipped_no_loc = 0   # NULL / empty location
+    skipped_wav    = 0   # location is WAV (not yet converted)
+    skipped_exists = 0   # already in PG
+    location_fixed = 0   # existing PG rows backfilled with MP3 location
+    errors         = []
+    inserted_rows  = []
 
     try:
-        # ── Fetch ALL rows for the date ───────────────────────────
         with mysql_conn.cursor() as cur:
             cur.execute("""
                 SELECT
@@ -482,16 +493,19 @@ def sync_recording_log(target_date: str = None) -> dict:
                 skipped_no_loc += 1
                 continue
 
-            # ── KEY FIX: skip rows with no location yet ───────────
-            # MySQL writes the recording file path AFTER the row is created.
-            # If location is empty, the file isn't ready — skip and retry
-            # next cycle when location will be populated.
+            # ── Skip: no location yet ────────────────────────────
             if not location:
                 skipped_no_loc += 1
-                print(f"[Sync] ⏭ No location yet (will retry): {filename}")
+                print(f"[Sync] ⏭ No location yet (retry next cycle): {filename}")
                 continue
 
-            # Already in PG — handled by backfill below if location changed
+            # ── Skip: WAV file — wait for MP3 conversion ─────────
+            if location.lower().endswith(".wav"):
+                skipped_wav += 1
+                print(f"[Sync] ⏭ WAV not yet converted to MP3 (retry next cycle): {filename}")
+                continue
+
+            # ── Skip: already in PG ──────────────────────────────
             if filename_exists_in_pg(filename):
                 skipped_exists += 1
                 continue
@@ -532,7 +546,7 @@ def sync_recording_log(target_date: str = None) -> dict:
 
                     if result_row:
                         inserted += 1
-                        print(f"[Sync] ✓ Inserted id={result_row[0]}: {filename}")
+                        print(f"[Sync] ✓ Inserted id={result_row[0]} [MP3]: {filename}")
                         inserted_rows.append({"id": result_row[0], "filename": filename})
                     else:
                         skipped_exists += 1
@@ -548,34 +562,42 @@ def sync_recording_log(target_date: str = None) -> dict:
                 errors.append(err)
                 print(f"[Sync ERROR] {err}")
 
-        # ── Backfill: update location for PG rows that still have NULL ──
-        # This handles rows that were inserted in an older version without
-        # the location check, and rows where MySQL updated location later.
+        # ── Backfill: update PG rows that have NULL or WAV location ──
+        # Covers rows inserted by older code, or rows waiting for MP3
         try:
             pg     = get_pg_conn()
             cur_pg = pg.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+            # Find pending PG rows with no location OR a WAV location
             cur_pg.execute("""
-                SELECT id, filename FROM call_analysis
+                SELECT id, filename, location FROM call_analysis
                 WHERE DATE(start_time) = %s
                   AND status = 'pending'
-                  AND (location IS NULL OR location = '')
+                  AND (
+                      location IS NULL
+                      OR location = ''
+                      OR lower(location) LIKE '%.wav'
+                  )
             """, (target_date,))
             null_rows = cur_pg.fetchall()
 
             if null_rows:
-                print(f"[Sync] Backfilling {len(null_rows)} existing pending row(s) with NULL location…")
-                with mysql_conn.cursor() as fix_cur:
+                print(f"[Sync] Backfilling {len(null_rows)} pending row(s) with NULL/WAV location…")
+                with mysql_conn.cursor(pymysql.cursors.DictCursor) as fix_cur:
                     for pg_row in null_rows:
+                        # Look for an MP3 location in MySQL
                         fix_cur.execute("""
                             SELECT location, length_in_sec, length_in_min
                             FROM recording_log
                             WHERE filename = %s
-                              AND location IS NOT NULL AND location != ''
+                              AND location IS NOT NULL
+                              AND location != ''
+                              AND lower(location) LIKE '%%.mp3'
                             LIMIT 1
                         """, (pg_row["filename"],))
                         mysql_row = fix_cur.fetchone()
                         if mysql_row and mysql_row.get("location"):
-                            new_loc   = mysql_row["location"].strip()
+                            new_loc   = parse_new_url(mysql_row["location"].strip())
                             new_phone = extract_phone_number(new_loc)
                             cur_pg.execute("""
                                 UPDATE call_analysis
@@ -593,9 +615,13 @@ def sync_recording_log(target_date: str = None) -> dict:
                             ))
                             pg.commit()
                             location_fixed += 1
-                            print(f"[Sync] ✓ Backfilled id={pg_row['id']}: {pg_row['filename']}")
+                            old_loc = pg_row.get("location") or "NULL"
+                            print(
+                                f"[Sync] ✓ Backfilled id={pg_row['id']} "
+                                f"({old_loc[-15:]} → MP3): {pg_row['filename']}"
+                            )
                         else:
-                            print(f"[Sync] ⏭ Still no location in MySQL for: {pg_row['filename']}")
+                            print(f"[Sync] ⏭ No MP3 yet in MySQL for: {pg_row['filename']}")
 
             cur_pg.close()
             pg.close()
@@ -603,20 +629,22 @@ def sync_recording_log(target_date: str = None) -> dict:
             print(f"[Sync] Backfill warning: {e}")
 
         summary = {
-            "date":              target_date,
-            "total_fetched":     len(rows),
-            "inserted":          inserted,
-            "skipped_no_loc":    skipped_no_loc,
-            "skipped_exists":    skipped_exists,
-            "backfilled":        location_fixed,
-            "error_count":       len(errors),
-            "errors":            errors,
-            "inserted_rows":     inserted_rows,
+            "date":            target_date,
+            "total_fetched":   len(rows),
+            "inserted":        inserted,
+            "skipped_no_loc":  skipped_no_loc,
+            "skipped_wav":     skipped_wav,
+            "skipped_exists":  skipped_exists,
+            "backfilled":      location_fixed,
+            "error_count":     len(errors),
+            "errors":          errors,
+            "inserted_rows":   inserted_rows,
         }
         print(
             f"[Sync] Done — inserted={inserted} | "
-            f"skipped_no_loc={skipped_no_loc} | skipped_exists={skipped_exists} | "
-            f"backfilled={location_fixed} | errors={len(errors)}"
+            f"skipped_no_loc={skipped_no_loc} | skipped_wav={skipped_wav} | "
+            f"skipped_exists={skipped_exists} | backfilled={location_fixed} | "
+            f"errors={len(errors)}"
         )
         return summary
 
@@ -629,7 +657,7 @@ def sync_recording_log(target_date: str = None) -> dict:
 # ═══════════════════════════════════════════════════════════════
 
 def get_unanalyzed(target_date: str = None) -> list:
-    """Return all status='pending' rows with a valid location for the given date."""
+    """Return all status='pending' rows with a valid MP3 location for the given date."""
     if not target_date:
         target_date = today_str()
     conn = get_pg_conn()
@@ -640,6 +668,7 @@ def get_unanalyzed(target_date: str = None) -> list:
             FROM call_analysis
             WHERE status   = 'pending'
               AND location IS NOT NULL AND location != ''
+              AND lower(location) LIKE '%%.mp3'
               AND DATE(start_time) = %s
             ORDER BY start_time ASC
         """, (target_date,))
@@ -649,15 +678,22 @@ def get_unanalyzed(target_date: str = None) -> list:
     finally:
         conn.close()
 
+def parse_new_url(url):
+    parsed = urlparse(url)
+    new_netloc = f"{parsed.hostname}:5165"
+    return urlunparse(parsed._replace(netloc=new_netloc))
+
 
 def download_audio(url: str) -> str:
-    print(f"[Download] {url}")
-    r = requests.get(url, timeout=60)
+    new_url = parse_new_url(url)
+
+    print(f"[Download] {new_url}")
+    r = requests.get(new_url, timeout=60)
     if r.status_code == 404:
-        raise FileNotFoundError(f"Recording not found (404): {url}")
+        raise FileNotFoundError(f"Recording not found (404): {new_url}")
     if r.status_code != 200:
-        raise Exception(f"HTTP {r.status_code} downloading: {url}")
-    suffix = Path(url.split("?")[0]).suffix or ".mp3"
+        raise Exception(f"HTTP {r.status_code} downloading: {new_url}")
+    suffix = Path(new_url.split("?")[0]).suffix or ".mp3"
     tmp    = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
     tmp.write(r.content)
     tmp.flush()
@@ -771,7 +807,7 @@ def process_recording(row: dict) -> dict:
     """
     Full pipeline for one pending recording:
 
-      1. Download audio
+      1. Download audio (MP3 only at this point)
       2. Audio analysis (pydub — requires ffmpeg):
            • Ringing throughout  → not_picked  (no Whisper/GPT cost)
            • Low volume          → boost audio, then continue
@@ -916,13 +952,14 @@ def _run_one_cycle(target_date: str) -> dict:
     cycle_failed   = 0
     cycle_errors   = []
 
-    # Step 1 — Sync MySQL records (only those with location)
+    # Step 1 — Sync MySQL records (MP3 only, skip WAV/NULL)
     try:
         sync_result    = sync_recording_log(target_date=target_date)
         cycle_inserted = sync_result.get("inserted", 0)
         print(
             f"[AutoLoop] Sync → inserted={sync_result['inserted']} | "
             f"skipped_no_loc={sync_result['skipped_no_loc']} | "
+            f"skipped_wav={sync_result['skipped_wav']} | "
             f"skipped_exists={sync_result['skipped_exists']} | "
             f"backfilled={sync_result['backfilled']} | "
             f"errors={sync_result['error_count']}"
@@ -933,7 +970,7 @@ def _run_one_cycle(target_date: str) -> dict:
         cycle_errors.append(msg)
         _log_error(msg)
 
-    # Steps 2+3 — Analyze only status='pending' rows with a location
+    # Steps 2+3 — Analyze only status='pending' MP3 rows
     try:
         pending = get_unanalyzed(target_date=target_date)
         print(f"[AutoLoop] Analyze → {len(pending)} pending recording(s)")
@@ -1013,14 +1050,11 @@ def auto_sync_analyze_loop():
 def startup():
     create_table()
 
-    # ── One-time migrations ───────────────────────────────────────
     try:
         conn = get_pg_conn()
         cur  = conn.cursor()
 
-        # 1. Reset rows that were wrongly marked not_picked by the old
-        #    disposition filter (analyzed_at NULL, avg_dbfs NULL, has location)
-        #    → back to pending so they go through audio+GPT properly
+        # 1. Reset rows wrongly marked not_picked by old disposition filter
         cur.execute("""
             UPDATE call_analysis
             SET status      = 'pending',
@@ -1030,11 +1064,11 @@ def startup():
               AND avg_dbfs   IS NULL
               AND location  IS NOT NULL
               AND location  != ''
+              AND lower(location) LIKE '%%.mp3'
         """)
         reset_disposition = cur.rowcount
 
-        # 2. Fix rows wrongly saved as 'skipped' by old code when GPT
-        #    said "Not Connected" — correct label is not_picked
+        # 2. Fix rows wrongly saved as 'skipped' when GPT said Not Connected
         cur.execute("""
             UPDATE call_analysis
             SET status = 'not_picked'
@@ -1044,17 +1078,35 @@ def startup():
         """)
         reset_skipped = cur.rowcount
 
+        # 3. Remove any WAV-location pending rows inserted by old code
+        #    so they get cleanly re-inserted as MP3 next sync cycle
+        cur.execute("""
+            DELETE FROM call_analysis
+            WHERE status = 'pending'
+              AND lower(location) LIKE '%%.wav'
+        """)
+        deleted_wav = cur.rowcount
+
+        # 4. Remove any NULL-location pending rows inserted by old code
+        cur.execute("""
+            DELETE FROM call_analysis
+            WHERE status = 'pending'
+              AND (location IS NULL OR location = '')
+        """)
+        deleted_null = cur.rowcount
+
         conn.commit()
         cur.close()
         conn.close()
 
         if reset_disposition > 0:
-            print(
-                f"[Startup] Migration: reset {reset_disposition} disposition-filtered "
-                f"row(s) back to pending — will re-analyze via audio+GPT"
-            )
+            print(f"[Startup] Migration: reset {reset_disposition} disposition-filtered row(s) → pending")
         if reset_skipped > 0:
             print(f"[Startup] Migration: fixed {reset_skipped} row(s) skipped → not_picked")
+        if deleted_wav > 0:
+            print(f"[Startup] Migration: deleted {deleted_wav} WAV-location row(s) — will re-sync as MP3")
+        if deleted_null > 0:
+            print(f"[Startup] Migration: deleted {deleted_null} NULL-location row(s) — will re-sync")
 
     except Exception as e:
         print(f"[Startup] Migration warning: {e}")
@@ -1071,13 +1123,14 @@ def startup():
 def health():
     return {
         "status":          "ok",
-        "version":         "5.4.0",
+        "version":         "5.5.0",
         "model":           "gpt-4o",
         "today":           today_str(),
         "loop_interval":   f"{AUTO_LOOP_INTERVAL_SECONDS // 60} minutes",
         "pydub_available": PYDUB_AVAILABLE,
+        "accepted_format": "MP3 only (WAV skipped until converted)",
         "statuses": {
-            "pending":      "Inserted with valid location, awaiting analysis",
+            "pending":      "Inserted with valid MP3 location, awaiting analysis",
             "not_picked":   "Ringing-only audio OR GPT confirmed not connected/voicemail/IVR",
             "successful":   "Fully transcribed and rated by GPT-4o (stars 1-5)",
             "failed":       "Unrecoverable processing error",
@@ -1115,7 +1168,7 @@ def status_summary(date: str = None):
 
 @app.get("/debug-sync")
 def debug_sync(date: str = None):
-    """Show raw MySQL vs PG counts — useful for diagnosing gaps."""
+    """Show MySQL vs PG counts broken down by file type."""
     target_date = date or today_str()
     result = {"date": target_date}
 
@@ -1128,17 +1181,25 @@ def debug_sync(date: str = None):
             )
             result["mysql_total"] = cur.fetchone().get("total", 0)
             cur.execute("""
-                SELECT COUNT(*) as with_location FROM recording_log
+                SELECT COUNT(*) as cnt FROM recording_log
                 WHERE DATE(start_time) = %s
                   AND location IS NOT NULL AND location != ''
+                  AND lower(location) LIKE '%%.mp3'
             """, (target_date,))
-            result["mysql_with_location"] = cur.fetchone().get("with_location", 0)
+            result["mysql_mp3_count"] = cur.fetchone().get("cnt", 0)
             cur.execute("""
-                SELECT COUNT(*) as no_location FROM recording_log
+                SELECT COUNT(*) as cnt FROM recording_log
+                WHERE DATE(start_time) = %s
+                  AND location IS NOT NULL AND location != ''
+                  AND lower(location) LIKE '%%.wav'
+            """, (target_date,))
+            result["mysql_wav_count"] = cur.fetchone().get("cnt", 0)
+            cur.execute("""
+                SELECT COUNT(*) as cnt FROM recording_log
                 WHERE DATE(start_time) = %s
                   AND (location IS NULL OR location = '')
             """, (target_date,))
-            result["mysql_no_location"] = cur.fetchone().get("no_location", 0)
+            result["mysql_no_location"] = cur.fetchone().get("cnt", 0)
             cur.execute("""
                 SELECT recording_id, filename, start_time, location
                 FROM recording_log WHERE DATE(start_time) = %s
@@ -1174,7 +1235,12 @@ def debug_sync(date: str = None):
             SELECT COUNT(*) FROM call_analysis
             WHERE DATE(start_time) = %s AND (location IS NULL OR location = '')
         """, (target_date,))
-        result["pg_null_location_count"] = cur.fetchone()[0]
+        result["pg_null_location"] = cur.fetchone()[0]
+        cur.execute("""
+            SELECT COUNT(*) FROM call_analysis
+            WHERE DATE(start_time) = %s AND lower(location) LIKE '%%.wav'
+        """, (target_date,))
+        result["pg_wav_location"] = cur.fetchone()[0]
         cur.close()
         pg.close()
         result["pg_status"] = "ok"

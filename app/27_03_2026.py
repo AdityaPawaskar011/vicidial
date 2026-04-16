@@ -189,12 +189,11 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
         payload       = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username      = payload.get("sub")
         is_admin      = payload.get("isAdmin", False)
-        user_level    = payload.get("user_level", 1)
         campaign_name = payload.get("campaign_name")
         campaign_id   = payload.get("campaign_id")
         if username is None:
             raise HTTPException(status_code=401, detail="Invalid token")
-        return {"username": username, "isAdmin": is_admin,"user_level":user_level,"campaign_name": campaign_name, "campaign_id": campaign_id}
+        return {"username": username, "isAdmin": is_admin, "campaign_name": campaign_name, "campaign_id": campaign_id}
     except JWTError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired or invalid")
 
@@ -381,14 +380,12 @@ def login(data: LoginRequest):
         access_token = create_access_token(data={
             "sub": user[0],
             "isAdmin": user[3] in (8, 9),   # ✅ FIXED HERE
-            "user_level": int(user[3]),
             "campaign_id": data.campaign_id,
             "campaign_name": data.campaign_name
         })
         refresh_token = create_refresh_token(data={
             "sub": user[0],
             "isAdmin": user[3] in (8, 9),
-            "user_level": int(user[3]),
             "campaign_id": data.campaign_id,
             "campaign_name": data.campaign_name
         })
@@ -536,57 +533,24 @@ def get_calls_by_status(request: Request, current_user: str = Depends(get_curren
         ed          = request.query_params.get("ed")
         admin_user  = current_user["username"]
 
-        date_filter = "DATE(event_time) BETWEEN %s AND %s AND status IS NOT NULL" if sd and ed else "DATE(event_time) = %s AND status IS NOT NULL"
-        date_params = (sd, ed) if sd and ed else (date.today(),)
+        # Use sd/ed if provided, otherwise default to today
+        date_filter = "DATE(call_date) BETWEEN %s AND %s" if sd and ed else "DATE(call_date) = %s"
+        params      = (sd, ed) if sd and ed else (date.today(),)
 
-        filters       = []
-        filter_params = []
+        filters = []
 
-        # ✅ ROLE BASED ACCESS CONTROL (FIXED)
-        filters.append("""
-            (
-                (SELECT user_level FROM vicidial_users WHERE user = %s) = 9
-                OR (
-                    (SELECT user_level FROM vicidial_users WHERE user = %s) > 1
-                    AND (
-                        SELECT vu2.user_group 
-                        FROM vicidial_users vu2 
-                        WHERE vu2.user = vicidial_live_agents.user
-                        LIMIT 1
-                    ) = (SELECT user_group FROM vicidial_users WHERE user = %s LIMIT 1)
-                )
-                OR (
-                    (SELECT user_level FROM vicidial_users WHERE user = %s) = 1
-                    AND vicidial_live_agents.user = %s
-                )
-            )
-        """)
-
-        filter_params.extend([
-            admin_user,
-            admin_user,
-            admin_user,
-            admin_user,
-            admin_user
-        ])
-
-        # ✅ EXISTING FILTER
-        filters.append("""
+        # Always restrict admin to only their assigned campaigns
+        filters.append(f"""
             campaign_id IN (
-                SELECT campaign_id FROM vicidial_campaign_agents WHERE user = %s
+                SELECT campaign_id FROM vicidial_campaign_agents WHERE user = '{admin_user}'
             )
         """)
-        filter_params.append(admin_user)
-
         filters.append("user != 'VDAD'")
 
         if campaign_id:
-            filters.append("campaign_id = %s")
-            filter_params.append(campaign_id)
-
+            filters.append(f"campaign_id = '{campaign_id}'")
         if user_id:
-            filters.append("user = %s")
-            filter_params.append(user_id)
+            filters.append(f"user = '{user_id}'")
 
         extra_filter = ("AND " + " AND ".join(filters)) if filters else ""
 
@@ -596,7 +560,7 @@ def get_calls_by_status(request: Request, current_user: str = Depends(get_curren
                 COUNT(CASE WHEN status='PAUSED' THEN 1 END) AS Paused,
                 COUNT(CASE WHEN status='READY'  THEN 1 END) AS Ready,
                 (
-                    SELECT COUNT(*) FROM vicidial_agent_log
+                    SELECT COUNT(*) FROM vicidial_log
                     WHERE {date_filter}
                     {extra_filter}
                 ) AS Totalcall
@@ -604,19 +568,11 @@ def get_calls_by_status(request: Request, current_user: str = Depends(get_curren
             WHERE 1=1 {extra_filter}
         """
 
-        params = (
-            *date_params,
-            *filter_params,
-            *filter_params
-        )
-
         cursor.execute(query, params)
         result = cursor.fetchall()
-
         cursor.close()
         conn.close()
         return {"count": len(result), "data": result}
-
     except Error as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -628,234 +584,66 @@ def get_totaldials(request: Request, current_user: dict = Depends(get_current_us
         sd          = request.query_params.get("sd")
         ed          = request.query_params.get("ed")
         is_admin    = current_user["isAdmin"]
-        admin_user  = current_user["username"]
 
         if not is_admin:
+            # Agent: always use their own user_id and campaign_id from login
             user_id     = current_user["username"]
             campaign_id = current_user["campaign_id"]
-            extra_filter = f"AND val.user = '{user_id}' AND val.campaign_id = '{campaign_id}'"
+            userfilter  = f" AND v.user='{user_id}' AND v.campaign_id='{campaign_id}' "
         else:
+            # Admin: get optional filters from query params
             campaign_id = request.query_params.get("campaign_id")
             user_id     = request.query_params.get("user_id")
+            admin_user  = current_user["username"]   # ← NEW
 
             filters = []
-            if campaign_id:
-                filters.append(f"val.campaign_id = '{campaign_id}'")
-            if user_id:
-                filters.append(f"val.user = '{user_id}'")
 
-            extra_filter = ("AND " + " AND ".join(filters)) if filters else ""
+            # ── NEW: restrict admin to only campaigns they are assigned to ──
+            filters.append(f"""
+                v.campaign_id IN (
+                    SELECT campaign_id FROM vicidial_campaign_agents WHERE user = '{admin_user}'
+                )
+            """)
+            filters.append("v.user != 'VDAD'")
+            # ────────────────────────────────────────────────────────────────
+
+            if campaign_id:
+                filters.append(f"v.campaign_id='{campaign_id}'")
+            if user_id:
+                filters.append(f"v.user='{user_id}'")
+
+            userfilter = (" AND " + " AND ".join(filters)) if filters else ""
 
         query = f"""
-            SELECT
-                call_date,
-                SUM(dialed_calls)       AS total_dials,
-                SUM(connected_calls)    AS connected_calls,
-                ROUND(SUM(connected_calls) / NULLIF(SUM(dialed_calls), 0) * 100, 2) AS connection_rate_pct,
-                SUM(login_duration)     AS login_duration,
-                SUM(pause_sec)          AS pause_sec,
-                SUM(wait_sec)           AS wait_sec,
-                SUM(TALK_TIME_SECONDS)  AS total_talk_time,
-                ROUND(SUM(TALK_TIME_SECONDS) / NULLIF(SUM(connected_calls), 0), 2) AS avg_talk_time_sec
+            SELECT total_dials, connected_calls, connection_rate_pct, total_talk_time,
+                   avg_talk_time_sec, leads_connected, sum(total_seconds) total_seconds
             FROM (
                 SELECT
-                    DATE(val.event_time) AS call_date,
-                    val.user,
-                    COUNT(*) AS dialed_calls,
-                    SUM(IF(val.status NOT IN (
-                        'N', 'B', 'AB', 'D', 'DROP', 
-                        'INVN', 'NA', 'DNC','ADC','FUC','NA'
-                    ), 1, 0)) AS connected_calls,
-                    SUM(val.pause_sec + val.wait_sec +
-                        val.talk_sec  + val.dispo_sec) AS login_duration,
-                    SUM(val.pause_sec) AS pause_sec,
-                    SUM(val.wait_sec) AS wait_sec,
-                    SUM(val.talk_sec) AS TALK_TIME_SECONDS
-                FROM vicidial_agent_log val
-                LEFT JOIN vicidial_users vu ON val.user = vu.user
-                WHERE DATE(val.event_time) BETWEEN %s AND %s
-                    AND val.status IS NOT NULL
-
-                    -- ✅ ROLE BASED ACCESS CONTROL
-                    AND (
-                        (SELECT user_level FROM vicidial_users WHERE user = %s) = 9
-                        OR (
-                            (SELECT user_level FROM vicidial_users WHERE user = %s) > 1
-                            AND vu.user_group = (SELECT user_group FROM vicidial_users WHERE user = %s)
-                        )
-                        OR (
-                            (SELECT user_level FROM vicidial_users WHERE user = %s) = 1
-                            AND val.user = %s
-                        )
-                    )
-
-                    -- ✅ EXISTING CAMPAIGN FILTER (UNCHANGED)
-                    AND val.campaign_id IN (
-                        SELECT campaign_id FROM vicidial_campaign_agents WHERE user = %s
-                    )
-                    AND val.user IN (
-                        SELECT DISTINCT vca.user
-                        FROM vicidial_campaign_agents vca
-                        WHERE vca.campaign_id IN (
-                            SELECT campaign_id
-                            FROM vicidial_campaign_agents
-                            WHERE user = %s
-                        )
-                    )
-
-                    {extra_filter}
-                GROUP BY val.user
+                    DATE(v.call_date) AS call_date,
+                    (SELECT count(*) FROM vicidial_log v WHERE date(call_date) BETWEEN %s AND %s {userfilter}) AS total_dials,
+                    (SELECT count(*) FROM vicidial_log v WHERE date(call_date) BETWEEN %s AND %s AND length_in_sec > 0 {userfilter}) AS connected_calls,
+                    ROUND((SUM(v.length_in_sec > 0) / COUNT(*)) * 100, 2) AS connection_rate_pct,
+                    (SELECT SUM(length_in_sec) FROM vicidial_log v WHERE DATE(call_date) BETWEEN %s AND %s {userfilter}) AS total_talk_time,
+                    (SELECT AVG(length_in_sec) FROM vicidial_log v WHERE date(call_date) BETWEEN %s AND %s AND length_in_sec > 0 {userfilter}) AS avg_talk_time_sec,
+                    COUNT(distinct v.lead_id) AS leads_connected,
+                    SUM(length_in_sec) AS total_seconds
+                FROM vicidial_log v
+                WHERE date(v.call_date) BETWEEN %s AND %s {userfilter}
+                GROUP BY DATE(v.call_date)
             ) a
         """
-
-        cursor.execute(query, (
-            sd, ed,
-
-            # ✅ role-based params (5)
-            admin_user,
-            admin_user,
-            admin_user,
-            admin_user,
-            admin_user,
-
-            # ✅ campaign params (2)
-            admin_user,
-            admin_user
-        ))
-
+        cursor.execute(query, (sd, ed, sd, ed, sd, ed, sd, ed, sd, ed))
+        # print(query)
         result = cursor.fetchall()
-
         for row in result:
-            row["total_talk_time"]  = seconds_to_hhmmss(row.get("total_talk_time") or 0)
-            row["login_duration"]   = seconds_to_hhmmss(
-                int(row["login_duration"].total_seconds())
-                if hasattr(row.get("login_duration"), "total_seconds")
-                else (row.get("login_duration") or 0)
-            )
-            row["avg_talk_time_sec"] = seconds_to_hhmmss(int(row.get("avg_talk_time_sec") or 0))
-
+            row["total_talk_time"] = seconds_to_hhmmss(row["total_talk_time"])
         cursor.close()
         conn.close()
         return {"data": result}
-
     except Error as e:
         print(e)
         raise HTTPException(status_code=500, detail=str(e))
 
-
-@app.get('/metalead-stats')
-def get_lead_stats(request: Request, current_user: dict = Depends(get_current_user)):
-    try:
-        conn        = mysql.connector.connect(**DB_CONFIG)
-        cursor      = conn.cursor(dictionary=True)
-        sd          = request.query_params.get("sd")
-        ed          = request.query_params.get("ed")
-        list_id     = request.query_params.get("list_id", "7022026")
-        is_admin    = current_user["isAdmin"]
-        admin_user  = current_user["username"]
-
-        if not is_admin:
-            user_id     = current_user["username"]
-            campaign_id = current_user["campaign_id"]
-            extra_filter = f"""
-                AND vl.user = '{user_id}'
-                AND vl.list_id IN (
-                    SELECT list_id FROM vicidial_lists WHERE campaign_id = '{campaign_id}'
-                )
-            """
-        else:
-            campaign_id = request.query_params.get("campaign_id")
-            user_id     = request.query_params.get("user_id")
-            filters = []
-            if campaign_id:
-                filters.append(f"""
-                    vl.list_id IN (
-                        SELECT list_id FROM vicidial_lists WHERE campaign_id = '{campaign_id}'
-                    )
-                """)
-            if user_id:
-                filters.append(f"vl.user = '{user_id}'")
-            extra_filter = ("AND " + " AND ".join(filters)) if filters else ""
-
-        date_filter = ""
-        date_params = []
-        if sd and ed:
-            date_filter = "AND DATE(vl.entry_date) BETWEEN %s AND %s"
-            date_params = [sd, ed]
-
-        scope_filter = """
-            AND vl.user IN (
-                SELECT DISTINCT vca.user
-                FROM vicidial_campaign_agents vca
-                WHERE vca.campaign_id IN (
-                    SELECT campaign_id
-                    FROM vicidial_campaign_agents
-                    WHERE user = %s
-                )
-            )
-        """
-
-        # ── Query 1: Total Leads (only list_id) ──────────────────────────
-        q1 = """
-            SELECT COUNT(*) AS total_leads
-            FROM vicidial_list vl
-            WHERE vl.list_id = %s
-        """
-        cursor.execute(q1, [list_id])
-        total_leads = cursor.fetchone()["total_leads"] or 0
-
-        # ── Query 2: Called Leads ─────────────────────────────────────────
-        date_filter_called = ""
-        # if sd and ed:
-        #     date_filter_called = "AND DATE(vl.last_local_call_time) BETWEEN %s AND %s"
-
-        q2 = f"""
-            SELECT COUNT(*) AS called_leads
-            FROM vicidial_list vl
-            WHERE vl.list_id = %s
-              AND vl.status != 'NEW'
-             
-        """
-        cursor.execute(q2, [list_id] )
-        called_leads = cursor.fetchone()["called_leads"] or 0
-
-        # ── Query 3: Pending Leads (list_id + status = NEW + all filters) ─
-        # ── Query 3: Pending Leads ────────────────────────────────────────
-        # entry_date <= ed means "leads that existed by that date and still not called"
-        date_filter_pending = ""
-        date_params_pending = []
-        if ed:
-            date_filter_pending = "AND DATE(vl.entry_date) <= %s"
-            date_params_pending = [ed]
-
-        q3 = f"""
-            SELECT COUNT(*) AS pending_leads
-            FROM vicidial_list vl
-            WHERE vl.list_id = %s
-              AND vl.status = 'NEW'
-              {date_filter_pending}
-              {scope_filter}
-              {extra_filter}
-        """
-        cursor.execute(q3, [list_id] + date_params_pending + [admin_user])
-        pending_leads = cursor.fetchone()["pending_leads"] or 0
-
-        cursor.close()
-        conn.close()
-
-        return {
-            "list_id":       list_id,
-            "sd":            sd,
-            "ed":            ed,
-            "total_leads":   total_leads,
-            "called_leads":  called_leads,
-            "pending_leads": pending_leads,
-        }
-
-    except Error as e:
-        print(e)
-        raise HTTPException(status_code=500, detail=str(e))
-    
 @app.get('/dialerperformance')
 def get_dialerperformance(request: Request, current_user: dict = Depends(get_current_user)):
     try:
@@ -917,13 +705,6 @@ def get_dialerperformance(request: Request, current_user: dict = Depends(get_cur
         raise HTTPException(status_code=500, detail=str(e))
 
 # --------------------------Campaign filter above -----------------------
-def seconds_to_hhmmss(total_seconds: int) -> str:
-    total_seconds = max(0, int(total_seconds))  # guard against negatives/None
-    hours   = total_seconds // 3600
-    minutes = (total_seconds % 3600) // 60
-    seconds = total_seconds % 60
-    return f"{hours:02}:{minutes:02}:{seconds:02}"
-
 @app.get('/agentsproductivity')
 def get_agentsproductivity(request: Request, current_user: str = Depends(get_current_user)):
     try:
@@ -937,100 +718,69 @@ def get_agentsproductivity(request: Request, current_user: str = Depends(get_cur
         if not is_admin:
             campaign_id  = current_user["campaign_id"]
             user_id      = current_user["username"]
-            extra_filter = f"AND val.campaign_id = '{campaign_id}' AND val.user = '{user_id}'"
+            extra_filter = f"AND vl.campaign_id = '{campaign_id}' AND vl.user = '{user_id}'"
         else:
             campaign_id = request.query_params.get("campaign_id")
             user_id     = request.query_params.get("user_id")
 
             filters = []
             if campaign_id:
-                filters.append(f"val.campaign_id = '{campaign_id}'")
+                filters.append(f"vl.campaign_id = '{campaign_id}'")
             if user_id:
-                filters.append(f"val.user = '{user_id}'")
+                filters.append(f"vl.user = '{user_id}'")
 
             extra_filter = ("AND " + " AND ".join(filters)) if filters else ""
 
         cursor.execute(f"""
-            SELECT
-                CONCAT('SIP/', val.user)                        AS STATION,
-                val.user                                        AS USER_ID,
-                MAX(vu.full_name)                               AS USER_NAME,
-                MAX(vla.status)                                 AS STATUS,
-                MAX(vu.user_group)                              AS user_group,
-                COUNT(*)                                        AS CALLS,
-                SUM(IF(val.status NOT IN (
-                    'N', 'B', 'AB', 'D', 'DROP', 
-                    'INVN', 'NA', 'DNC','ADC','FUC','NA'
-                ), 1, 0))                                                       AS connected_calls,
-                SUM(val.pause_sec + val.wait_sec +
-                    val.talk_sec  + val.dispo_sec)              AS login_duration,
-                SUM(val.pause_sec)                              AS pause_sec,
-                SUM(val.wait_sec)                               AS wait_sec,
-                SUM(val.talk_sec)                               AS TALK_TIME_SECONDS,
-                SUM(val.dispo_sec)                              AS dispo_sec,
-                SUM(val.dead_sec)                               AS dead_sec,
-                SUM(val.talk_sec - val.dead_sec)                AS customer_sec,
-                SUM(IF(val.status = 'B',    1, 0))             AS dispo_B,
-                SUM(IF(val.status = 'C',    1, 0))             AS dispo_C,
-                SUM(IF(val.status = 'D',    1, 0))             AS dispo_D,
-                SUM(IF(val.status = 'EC',   1, 0))             AS dispo_EC,
-                SUM(IF(val.status = 'FUC',  1, 0))             AS dispo_FUC,
-                SUM(IF(val.status = 'IN',   1, 0))             AS dispo_IN,
-                SUM(IF(val.status = 'INVN', 1, 0))             AS dispo_INVN,
-                SUM(IF(val.status = 'N',    1, 0))             AS dispo_N,
-                SUM(IF(val.status = 'NI',   1, 0))             AS dispo_NI,
-                SUM(IF(val.status = 'WN',   1, 0))             AS dispo_WN
-            FROM vicidial_agent_log val
-            LEFT JOIN vicidial_users vu ON val.user = vu.user
-            LEFT JOIN vicidial_live_agents vla on val.user = vla.user           
-            WHERE DATE(val.event_time) BETWEEN %s AND %s
-                AND val.status IS NOT NULL
-                 AND (
-                    (SELECT user_level FROM vicidial_users WHERE user = %s) = 9
-                    OR (
-                        (SELECT user_level FROM vicidial_users WHERE user = %s) > 1
-                        AND vu.user_group = (SELECT user_group FROM vicidial_users WHERE user = %s)
-                    )
-                    OR (
-                        (SELECT user_level FROM vicidial_users WHERE user = %s) = 1
-                        AND val.user = %s
-                    )
-                )
-                {extra_filter}
-            GROUP BY val.user
-            ORDER BY MAX(vu.full_name) ASC
-        """, (sd, ed,
-                current_user["username"],  # level check
-                current_user["username"],  # level >1
-                current_user["username"],  # group match
-                current_user["username"],  # level =1
-                current_user["username"],  # self
-                ))
+            SELECT 
+                CONCAT('SIP/',vl.user) AS STATION, 
+                vl.user AS USER_ID,
+                MAX(vu.full_name) AS USER_NAME,
+                GROUP_CONCAT(DISTINCT vc.campaign_name) AS CAMPAIGN_NAME,
+                MAX(vla.status) AS STATUS,
+                COUNT(*) AS CALLS, 
+                SUM(vl.length_in_sec > 0) AS connected_calls,
+                MAX(vl.phone_number) AS phone_number,
+                SEC_TO_TIME(IFNULL(MAX(al.login_seconds),0)) AS login_duration,
+                MAX(UNIX_TIMESTAMP(NOW()) - UNIX_TIMESTAMP(vla.last_state_change)) AS TALK_TIME_SECONDS
+            FROM vicidial_log vl
+            LEFT JOIN vicidial_users vu ON vl.user = vu.user
+            LEFT JOIN vicidial_live_agents vla ON vl.user = vla.user
+            LEFT JOIN vicidial_campaigns vc ON vl.campaign_id = vc.campaign_id
+            LEFT JOIN (
+                SELECT user, 
+                    SUM(pause_sec + wait_sec + talk_sec + dispo_sec) AS login_seconds
+                FROM vicidial_agent_log 
+                WHERE DATE(event_time) BETWEEN %s AND %s 
+                GROUP BY user
+            ) al ON vl.user = al.user
+            WHERE DATE(vl.call_date) BETWEEN %s AND %s
 
+            -- ✅ Filter BOTH the call's campaign AND the agent by AdminR's assigned campaigns
+            AND vl.campaign_id IN (
+                SELECT campaign_id 
+                FROM vicidial_campaign_agents 
+                WHERE user = %s
+            )
+            AND vl.user IN (
+                SELECT DISTINCT vca.user
+                FROM vicidial_campaign_agents vca
+                WHERE vca.campaign_id IN (
+                    SELECT campaign_id 
+                    FROM vicidial_campaign_agents 
+                    WHERE user = %s
+                )
+            )
+
+            {extra_filter}
+            GROUP BY vl.user
+            ORDER BY vl.user;
+        """, (sd, ed, sd, ed, current_user["username"], current_user["username"]))
         result = cursor.fetchall()
         for row in result:
             row["TALK_TIME_HH_MM_SS"] = format_time(row.get("TALK_TIME_SECONDS", 0))
-
-            login_raw = row.get("login_duration", 0)
-            if hasattr(login_raw, "total_seconds"):
-                total_seconds = int(login_raw.total_seconds())
-            elif login_raw is not None:
-                total_seconds = int(login_raw)
-            else:
-                total_seconds = 0
-
-            row["login_duration"] = seconds_to_hhmmss(total_seconds)
-
-            paused_sec = row.get("pause_sec", 0)
-            if hasattr(login_raw, "total_seconds"):
-                pause_seconds = int(paused_sec.total_seconds())
-            elif login_raw is not None:
-                pause_seconds = int(paused_sec)
-            else:
-                pause_seconds = 0
-            row["pause_sec"] = seconds_to_hhmmss(pause_seconds)
-            
-
+            if hasattr(row["login_duration"], "total_seconds"):
+                row["login_duration"] = seconds_to_hhmmss(row["login_duration"].total_seconds())
         cursor.close()
         conn.close()
 
@@ -1047,7 +797,7 @@ def get_agentsproductivity(request: Request, current_user: str = Depends(get_cur
                     SUM(CASE WHEN call_outcome = 'Not Converted'   THEN 1 ELSE 0 END) AS not_converted,
                     SUM(CASE WHEN call_outcome = 'Lead Generated'  THEN 1 ELSE 0 END) AS leads_generated
                 FROM call_analysis
-                WHERE status IN ('success', 'successful')
+                WHERE status in  ('success','successful')
                   AND DATE(start_time) BETWEEN %s AND %s
                 GROUP BY agent_user
             """, (sd, ed))
@@ -1069,18 +819,18 @@ def get_agentsproductivity(request: Request, current_user: str = Depends(get_cur
 
         for row in result:
             ratings = rating_map.get(row.get("USER_ID"), {})
-            row["avg_rating"]       = ratings.get("avg_rating",       None)
-            row["avg_stars"]        = ratings.get("avg_stars",         None)
-            row["total_analyzed"]   = ratings.get("total_analyzed",    0)
-            row["successful_sales"] = ratings.get("successful_sales",  0)
-            row["not_converted"]    = ratings.get("not_converted",     0)
-            row["leads_generated"]  = ratings.get("leads_generated",   0)
+            row["avg_rating"]       = ratings.get("avg_rating",      None)
+            row["avg_stars"]        = ratings.get("avg_stars",        None)
+            row["total_analyzed"]   = ratings.get("total_analyzed",   0)
+            row["successful_sales"] = ratings.get("successful_sales", 0)
+            row["not_converted"]    = ratings.get("not_converted",    0)
+            row["leads_generated"]  = ratings.get("leads_generated",  0)
 
         return {"data": result}
 
     except Error as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
+
 @app.get('/campaignperformance')
 def get_campaignperformance(request: Request, current_user: str = Depends(get_current_user)):
     try:
@@ -1091,117 +841,45 @@ def get_campaignperformance(request: Request, current_user: str = Depends(get_cu
         campaign_id = request.query_params.get("campaign_id")
         user_id     = request.query_params.get("user_id")
         admin_user  = current_user["username"]
-        is_admin    = current_user["isAdmin"]
 
-        if not is_admin:
-            user_id     = current_user["username"]
-            campaign_id = current_user["campaign_id"]
-            extra_filter = f"AND val.user = '{user_id}' AND val.campaign_id = '{campaign_id}'"
-        else:
-            filters = []
-            if campaign_id:
-                filters.append(f"val.campaign_id = '{campaign_id}'")
-            if user_id:
-                filters.append(f"val.user = '{user_id}'")
-            extra_filter = ("AND " + " AND ".join(filters)) if filters else ""
+        filters = []
+
+        # Always restrict admin to only their assigned campaigns
+        filters.append(f"""
+            vl.campaign_id IN (
+                SELECT campaign_id FROM vicidial_campaign_agents WHERE user = '{admin_user}'
+            )
+        """)
+        filters.append("vl.user != 'VDAD'")
+
+        # Optional filters
+        if campaign_id:
+            filters.append(f"vl.campaign_id = '{campaign_id}'")
+        if user_id:
+            filters.append(f"vl.user = '{user_id}'")
+
+        extra_filter = ("AND " + " AND ".join(filters)) if filters else ""
 
         cursor.execute(f"""
-            SELECT
-                val.campaign_id AS campaign_id,
-                COUNT(*) AS total_dials,
-                SUM(IF(val.status NOT IN (
-                    'N', 'B', 'AB', 'D', 'DROP', 
-                    'INVN', 'NA', 'DNC','ADC','FUC','NA'
-                ), 1, 0)) AS connected_calls,
-                ROUND((SUM(IF(val.talk_sec > 0, 1, 0)) / COUNT(*)) * 100, 2) AS connection_rate_pct,
-                SUM(val.pause_sec + val.wait_sec +
-                    val.talk_sec  + val.dispo_sec) AS login_duration,
-                SUM(val.pause_sec) AS pause_sec,
-                SUM(val.wait_sec) AS wait_sec,
-                SUM(val.talk_sec) AS total_talk_time,
-                ROUND(SUM(val.talk_sec) / NULLIF(SUM(IF(val.talk_sec > 0, 1, 0)), 0), 2) AS avg_talk_time_sec,
-                ROUND((SUM(val.status = 'DROP') / COUNT(*)) * 100, 2) AS drop_rate_pct,
-                SUM(val.status IN ('SALE','SUCCESS','CONVERTED')) AS conversions,
-                SUM(val.dispo_sec) AS dispo_sec,
-                SUM(val.dead_sec) AS dead_sec,
-                SUM(val.talk_sec - val.dead_sec) AS customer_sec,
-                SUM(IF(val.status = 'B',    1, 0)) AS dispo_B,
-                SUM(IF(val.status = 'C',    1, 0)) AS dispo_C,
-                SUM(IF(val.status = 'D',    1, 0)) AS dispo_D,
-                SUM(IF(val.status = 'EC',   1, 0)) AS dispo_EC,
-                SUM(IF(val.status = 'FUC',  1, 0)) AS dispo_FUC,
-                SUM(IF(val.status = 'IN',   1, 0)) AS dispo_IN,
-                SUM(IF(val.status = 'INVN', 1, 0)) AS dispo_INVN,
-                SUM(IF(val.status = 'N',    1, 0)) AS dispo_N,
-                SUM(IF(val.status = 'NI',   1, 0)) AS dispo_NI,
-                SUM(IF(val.status = 'WN',   1, 0)) AS dispo_WN
-            FROM vicidial_agent_log val
-            LEFT JOIN vicidial_users vu ON val.user = vu.user
-            WHERE DATE(val.event_time) BETWEEN %s AND %s
-                AND val.status IS NOT NULL
-
-                -- ✅ ROLE BASED ACCESS CONTROL
-                AND (
-                    (SELECT user_level FROM vicidial_users WHERE user = %s) = 9
-                    OR (
-                        (SELECT user_level FROM vicidial_users WHERE user = %s) > 1
-                        AND vu.user_group = (SELECT user_group FROM vicidial_users WHERE user = %s)
-                    )
-                    OR (
-                        (SELECT user_level FROM vicidial_users WHERE user = %s) = 1
-                        AND val.user = %s
-                    )
-                )
-
-                -- ✅ EXISTING CAMPAIGN FILTER (UNCHANGED)
-                AND val.campaign_id IN (
-                    SELECT campaign_id FROM vicidial_campaign_agents WHERE user = %s
-                )
-                AND val.user IN (
-                    SELECT DISTINCT vca.user
-                    FROM vicidial_campaign_agents vca
-                    WHERE vca.campaign_id IN (
-                        SELECT campaign_id
-                        FROM vicidial_campaign_agents
-                        WHERE user = %s
-                    )
-                )
-
-                {extra_filter}
-            GROUP BY val.campaign_id
-            ORDER BY total_dials DESC
-        """, (
-            sd, ed,
-
-            # ✅ role-based params (5)
-            admin_user,
-            admin_user,
-            admin_user,
-            admin_user,
-            admin_user,
-
-            # ✅ campaign params (2)
-            admin_user,
-            admin_user
-        ))
+            SELECT vl.campaign_id, COUNT(*) AS total_dials, SUM(vl.length_in_sec > 0) AS connected_calls,
+                   ROUND((SUM(vl.length_in_sec > 0) / COUNT(*)) * 100, 2) AS connection_rate_pct,
+                   SEC_TO_TIME(SUM(vl.length_in_sec)) AS total_talk_time,
+                   AVG(vl.length_in_sec) AS avg_talk_time,
+                   ROUND((SUM(vl.status = 'DROP') / COUNT(*)) * 100, 2) AS drop_rate_pct,
+                   SUM(vl.status IN ('SALE','SUCCESS','CONVERTED')) AS conversions
+            FROM vicidial_log vl
+            WHERE DATE(vl.call_date) BETWEEN %s AND %s
+            {extra_filter}
+            GROUP BY vl.campaign_id ORDER BY total_dials DESC
+        """, (sd, ed))
 
         result = cursor.fetchall()
-
         for row in result:
-            talk = row.get("total_talk_time") or 0
-            row["total_talk_time"] = seconds_to_hhmmss(
-                int(talk.total_seconds()) if hasattr(talk, "total_seconds") else int(talk)
-            )
-
-            login = row.get("login_duration") or 0
-            row["login_duration"] = seconds_to_hhmmss(
-                int(login.total_seconds()) if hasattr(login, "total_seconds") else int(login)
-            )
-
+            if hasattr(row["total_talk_time"], "total_seconds"):
+                row["total_talk_time"] = seconds_to_hhmmss(row["total_talk_time"].total_seconds())
         cursor.close()
         conn.close()
         return {"data": result}
-
     except Error as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1229,6 +907,7 @@ def get_compliancereview(current_user: str = Depends(get_current_user)):
     except Error as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get('/leadfunnel')
 def get_LeadFunnel(request: Request, current_user: str = Depends(get_current_user)):
     try:
@@ -1238,102 +917,52 @@ def get_LeadFunnel(request: Request, current_user: str = Depends(get_current_use
         user_id     = request.query_params.get("user_id")
         admin_user  = current_user["username"]
 
-        filters       = []
-        filter_params = []
+        filters = []
 
-        # ✅ ROLE BASED ACCESS CONTROL (NEW)
-        filters.append("""
-            (
-                (SELECT user_level FROM vicidial_users WHERE user = %s) = 9
-                OR (
-                    (SELECT user_level FROM vicidial_users WHERE user = %s) > 1
-                    AND vu.user_group = (SELECT user_group FROM vicidial_users WHERE user = %s)
-                )
-                OR (
-                    (SELECT user_level FROM vicidial_users WHERE user = %s) = 1
-                    AND val.user = %s
-                )
+        # Always restrict admin to only their assigned campaigns
+        filters.append(f"""
+            campaign_id IN (
+                SELECT campaign_id FROM vicidial_campaign_agents WHERE user = '{admin_user}'
             )
         """)
+        filters.append("user != 'VDAD'")
 
-        # add 5 params for role logic
-        filter_params.extend([
-            admin_user,
-            admin_user,
-            admin_user,
-            admin_user,
-            admin_user
-        ])
-
-        # ✅ EXISTING FILTERS (UNCHANGED BUT PARAM SAFE)
-        filters.append("""
-            val.user IN (
-                SELECT DISTINCT vca.user
-                FROM vicidial_campaign_agents vca
-                WHERE vca.campaign_id IN (
-                    SELECT campaign_id FROM vicidial_campaign_agents WHERE user = %s
-                )
-            )
-        """)
-        filter_params.append(admin_user)
-
-        filters.append("val.status IS NOT NULL")
-
-        filters.append("""
-            val.campaign_id IN (
-                SELECT campaign_id FROM vicidial_campaign_agents WHERE user = %s
-            )
-        """)
-        filter_params.append(admin_user)
-
-        # optional filters
         if campaign_id:
-            filters.append("val.campaign_id = %s")
-            filter_params.append(campaign_id)
-
+            filters.append(f"campaign_id = '{campaign_id}'")
         if user_id:
-            filters.append("val.user = %s")
-            filter_params.append(user_id)
+            filters.append(f"user = '{user_id}'")
 
         extra_filter = ("AND " + " AND ".join(filters)) if filters else ""
 
         conn   = mysql.connector.connect(**DB_CONFIG)
         cursor = conn.cursor(dictionary=True)
 
-        base_select = """
-            SELECT
-                COUNT(*)                                            AS dialed,
-                SUM(val.status IN ('IN','CBR','INTEREST','I'))      AS Interested,
-                SUM(IF(val.status NOT IN (
-                    'N', 'B', 'AB', 'D', 'DROP', 
-                    'INVN', 'NA', 'DNC','ADC','FUC','NA'
-                ), 1, 0))                                          AS connected,
-                SUM(val.status IN ('CON','SUCCESS','CONVERTED'))    AS converted,
-                SUM(val.status IN ('EC'))                           AS existing_clients
-            FROM vicidial_agent_log val
-            LEFT JOIN vicidial_users vu ON val.user = vu.user
-        """
-
         if sd and ed:
             cursor.execute(f"""
-                {base_select}
-                WHERE DATE(val.event_time) BETWEEN %s AND %s
+                SELECT COUNT(*) AS dialed, SUM(status IN ('IN','CBR','INTEREST','I')) AS Interested,
+                       SUM(length_in_sec > 0) AS connected, SUM(status IN ('CON','SUCCESS','CONVERTED')) AS converted,
+                       SUM(status IN ('EC')) AS existing_clients
+                FROM vicidial_log
+                WHERE date(call_date) BETWEEN %s AND %s
                 {extra_filter}
-            """, (sd, ed, *filter_params))
+            """, (sd, ed))
         else:
             cursor.execute(f"""
-                {base_select}
-                WHERE DATE(val.event_time) = %s
+                SELECT COUNT(*) AS dialed, SUM(status IN ('IN','CBR','INTEREST','I')) AS Interested,
+                       SUM(length_in_sec > 0) AS connected, SUM(status IN ('CON','SUCCESS','CONVERTED')) AS converted,
+                       SUM(status IN ('EC')) AS existing_clients
+                FROM vicidial_log
+                WHERE date(call_date) = %s
                 {extra_filter}
-            """, (date.today(), *filter_params))
+            """, (date.today(),))
 
         result = cursor.fetchone()
         cursor.close()
         conn.close()
         return {"data": result}
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get('/hourlyperformance')
 def get_hourlyperformance(request: Request, current_user: str = Depends(get_current_user)):
@@ -1365,14 +994,11 @@ def get_hourlyperformance(request: Request, current_user: str = Depends(get_curr
         extra_filter = ("AND " + " AND ".join(filters)) if filters else ""
 
         cursor.execute(f"""
-            SELECT HOUR(event_time) AS hour, COUNT(*) AS total_calls,SUM(IF(status NOT IN (
-                    'N', 'B', 'AB', 'D', 'DROP', 
-                    'INVN', 'NA', 'DNC','ADC','FUC','NA'
-                ), 1, 0))  AS connected_calls
-            FROM vicidial_agent_log
-            WHERE DATE(event_time) = %s and status is not NULL
+            SELECT HOUR(call_date) AS hour, COUNT(*) AS total_calls, SUM(length_in_sec > 0) AS connected_calls
+            FROM vicidial_log
+            WHERE DATE(call_date) = %s
             {extra_filter}
-            GROUP BY HOUR(event_time) ORDER BY hour
+            GROUP BY HOUR(call_date) ORDER BY hour
         """, (today_start,))
 
         result = cursor.fetchall()
@@ -1459,7 +1085,7 @@ def get_leads(request: Request, current_user: str = Depends(get_current_user)):
 
         if sd and ed:
             cursor.execute("""
-                SELECT row_number() over (order by vl.entry_date desc,lead_id) rn,DATE(vl.entry_date) AS entry_date, vl.lead_id, vl.phone_number,
+                SELECT DATE(vl.entry_date) AS entry_date, vl.lead_id, vl.phone_number,
                        vl.first_name, vl.last_name, vl.status, vl.list_id, vls.campaign_id, vl.user
                 FROM vicidial_list vl JOIN vicidial_lists vls ON vl.list_id = vls.list_id
                 WHERE date(vl.entry_date) BETWEEN %s AND %s
@@ -1467,7 +1093,7 @@ def get_leads(request: Request, current_user: str = Depends(get_current_user)):
             """, (sd, ed, limit))
         else:
             cursor.execute("""
-                SELECT row_number() over (order by vl.entry_date desc,lead_id) rn,DATE(vl.entry_date) AS entry_date, vl.lead_id, vl.phone_number,
+                SELECT DATE(vl.entry_date) AS entry_date, vl.lead_id, vl.phone_number,
                        vl.first_name, vl.last_name, vl.status, vl.list_id, vls.campaign_id, vl.user
                 FROM vicidial_list vl JOIN vicidial_lists vls ON vl.list_id = vls.list_id
                 WHERE date(vl.entry_date) = %s
@@ -1480,6 +1106,7 @@ def get_leads(request: Request, current_user: str = Depends(get_current_user)):
         return {"limit": limit, "count": len(data), "leads": data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/upload_excel_leads")
 def upload_excel_leads(
@@ -1509,61 +1136,36 @@ def upload_excel_leads(
     skipped   = []
     not_valid = []
 
-    # ✅ Get DB connection once for the entire upload
-    db     = get_mysql_conn()
-    cursor = db.cursor()
+    for index, row in df.iterrows():
+        excel_row = index + 2
+        phone     = clean_phone(row.get("phone_number"))
+        list_id   = str(row.get("list_id")).strip()
 
-    try:
-        for index, row in df.iterrows():
-            excel_row = index + 2
-            phone     = clean_phone(row.get("phone_number"))
-            list_id   = str(row.get("list_id")).strip()
-            agent_id  = str(row.get("agent_id", "")).strip()
+        if not validate_list_campaign(list_id, campaign_id):
+            not_valid.append({"row": excel_row, "list_id": list_id, "reason": f"List {list_id} not in campaign {campaign_id}"})
+            continue
+        if not phone or not list_id:
+            skipped.append({"row": excel_row, "reason": "Missing phone or list_id"})
+            continue
+        if not phone.isdigit():
+            skipped.append({"row": excel_row, "phone": phone, "reason": "Invalid phone number"})
+            continue
 
-            if not validate_list_campaign(list_id, campaign_id):
-                not_valid.append({"row": excel_row, "list_id": list_id, "reason": f"List {list_id} not in campaign {campaign_id}"})
-                continue
-            if not phone or not list_id:
-                skipped.append({"row": excel_row, "reason": "Missing phone or list_id"})
-                continue
-            if not phone.isdigit():
-                skipped.append({"row": excel_row, "phone": phone, "reason": "Invalid phone number"})
-                continue
-
-            try:
-                response = requests.get(vicidial_url, params={
-                    "source": SOURCE, "user": vici_user, "pass": Vici_pass,
-                    "function": "add_lead", "phone_number": phone, "phone_code": "1",
-                    "list_id": list_id,
-                    "first_name": str(row.get("first_name", "")).strip(),
-                    "last_name":  str(row.get("last_name", "")).strip(),
-                    **({"agent_only": agent_id} if agent_id else {}),
-                }, timeout=10)
-
-                if "SUCCESS" in response.text.upper():
-                    success += 1
-                    existing_phones.add(phone)
-
-                    # ✅ Update user column only if agent_id provided
-                    if agent_id:
-                        cursor.execute("""
-                            UPDATE vicidial_list 
-                            SET user = %s 
-                            WHERE phone_number = %s AND list_id = %s 
-                            ORDER BY lead_id DESC 
-                            LIMIT 1
-                        """, (agent_id, phone, list_id))
-                        db.commit()
-                else:
-                    failed.append({"row": excel_row, "phone": phone, "error": response.text})
-
-            except Exception as e:
-                failed.append({"row": excel_row, "phone": phone, "error": str(e)})
-
-    finally:
-        # ✅ Always close DB connection when done
-        cursor.close()
-        db.close()
+        try:
+            response = requests.get(vicidial_url, params={
+                "source": SOURCE, "user": vici_user, "pass": Vici_pass,
+                "function": "add_lead", "phone_number": phone, "phone_code": "1",
+                "list_id": list_id,
+                "first_name": str(row.get("first_name", "")).strip(),
+                "last_name":  str(row.get("last_name", "")).strip(),
+            }, timeout=10)
+            if "SUCCESS" in response.text.upper():
+                success += 1
+                existing_phones.add(phone)
+            else:
+                failed.append({"row": excel_row, "phone": phone, "error": response.text})
+        except Exception as e:
+            failed.append({"row": excel_row, "phone": phone, "error": str(e)})
 
     return {
         "campaign_id": campaign_id, "campaign_name": campaign_name,
@@ -1571,6 +1173,7 @@ def upload_excel_leads(
         "failed": len(failed), "skipped": len(skipped),
         "failed_details": failed, "skipped_details": skipped, "list_and_campaign": not_valid
     }
+
 
 @app.post("/delete_lead")
 def delet_lead(data: DeleteLeadRequest, current_user: str = Depends(get_current_user)):
@@ -1956,3 +1559,5 @@ def send_sms(data: SMSRequest):
         return {"success": True, "message_sid": message.sid, "status": message.status, "to_phone_number": phone_number}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+

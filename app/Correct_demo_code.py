@@ -2149,6 +2149,7 @@ async def receive_facebook_webhook(request: Request):
     return PlainTextResponse(content="OK", status_code=200)
 
 
+
 # ── Privacy / Terms / Delete (required by Meta app review) ────
 @app.get("/privacy", response_class=HTMLResponse)
 def privacy_policy():
